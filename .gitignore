@@ -1,5 +1,41 @@
+# Python environments and generated caches
 venv/
+.venv/
+env/
+ENV/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration, credentials, and session artifacts
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cookie
+*.cookies
+credentials.json
+secrets.json
+
+# Local logs and generated reports
+*.log
+reports/
+generated-reports/
+scan_report.json
+scan_report.pdf
+report.json
+report.pdf
+report.txt
+*_scan_report.json
+*_scan_report.pdf
+*_scan_report.txt
+
 .DS_Store

@@ -32,8 +32,8 @@ COPY --from=builder /install /usr/local
 COPY app.py scanner.py report.py ./
 COPY templates/ templates/
 
-# Logs directory (writable by non-root)
-RUN mkdir -p /app/logs && chown -R scanner:scanner /app
+# Ensure the non-root user owns the application files.
+RUN chown -R scanner:scanner /app
 
 USER scanner
 
@@ -43,14 +43,18 @@ ENV FLASK_ENV=production \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Gunicorn: 4 workers, 120s timeout, bind all interfaces
+# Threaded workers keep health and dashboard requests responsive during scans.
 CMD ["gunicorn", \
-     "--workers", "4", \
-     "--worker-class", "sync", \
+     "--workers", "2", \
+     "--worker-class", "gthread", \
+     "--threads", "4", \
      "--bind", "0.0.0.0:5000", \
-     "--timeout", "120", \
+     "--timeout", "180", \
      "--keep-alive", "5", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "--log-level", "info", \
      "app:app"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]

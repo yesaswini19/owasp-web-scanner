@@ -1,0 +1,46 @@
+services:
+  owasp-scanner:
+    environment:
+      SCANNER_LOCAL_LAB_URL: "http://dvwa:80"
+      SCANNER_LOCAL_LAB_IP: "${SCANNER_LOCAL_LAB_IP:?Set SCANNER_LOCAL_LAB_IP in the ignored .env file}"
+      SCANNER_LOCAL_LAB_AUTH_ENABLED: "1"
+    ports: !reset []
+    networks:
+      lab:
+        ipv4_address: "${SCANNER_CONTAINER_IP:?Set SCANNER_CONTAINER_IP in the ignored .env file}"
+
+  dvwa:
+    image: vulnerables/web-dvwa@sha256:dae203fe11646a86937bf04db0079adef295f426da68a92b40e3b181f337daa7
+    container_name: owasp-dvwa
+    ports: !reset []
+    restart: unless-stopped
+    networks:
+      lab:
+        ipv4_address: "${SCANNER_LOCAL_LAB_IP:?Set SCANNER_LOCAL_LAB_IP in the ignored .env file}"
+
+  lab-gateway:
+    image: nginx@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
+    container_name: owasp-lab-gateway
+    ports:
+      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./nginx-lab.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - owasp-scanner
+      - dvwa
+    restart: unless-stopped
+    networks:
+      - lab
+      - host_access
+
+networks:
+  lab:
+    name: owasp-dvwa-lab
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: "${SCANNER_LOCAL_LAB_SUBNET:?Set SCANNER_LOCAL_LAB_SUBNET in the ignored .env file}"
+  host_access:
+    name: owasp-dvwa-host-access

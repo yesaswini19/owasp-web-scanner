@@ -255,6 +255,28 @@
     }
     .checkbox-label input { accent-color: var(--accent); width: 14px; height: 14px; }
 
+    .lab-auth-fields {
+      display: none;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: .75rem;
+      margin-top: .75rem;
+    }
+    .lab-auth-fields.visible { display: grid; }
+    .lab-auth-fields input {
+      min-width: 0;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .7rem .85rem;
+      color: var(--text);
+      font: .82rem var(--mono);
+    }
+    .lab-auth-note {
+      grid-column: 1 / -1;
+      color: var(--text-dim);
+      font-size: .72rem;
+    }
+
     /* ── Progress terminal ────────────────────────────── */
     #progress-block {
       display: none;
@@ -512,7 +534,7 @@
     <div class="nav-item" id="nav-xss"    style="font-size:.75rem">A03 · XSS</div>
     <div class="nav-item" id="nav-misc"   style="font-size:.75rem">A05 · Misconfiguration</div>
     <div class="nav-item" id="nav-bac"    style="font-size:.75rem">A01 · Access Control</div>
-    <div class="nav-item" id="nav-auth"   style="font-size:.75rem">A07 · Auth Weakness</div>
+    <div class="nav-item" id="nav-auth"   style="font-size:.75rem">A07 · Not assessed</div>
     <div class="nav-item" id="nav-data"   style="font-size:.75rem">A02 · Data Exposure</div>
     <div class="nav-item" id="nav-comp"   style="font-size:.75rem">A06 · Components</div>
   </nav>
@@ -537,10 +559,17 @@
           <input type="checkbox" id="crawl-toggle"/>
           Enable crawler (scan multiple pages, max 20)
         </label>
-        <label class="checkbox-label" style="margin-left:auto">
-          <input type="checkbox" id="deep-toggle"/>
-          Deep detection (slower, more thorough)
+        <label class="checkbox-label">
+          <input type="checkbox" id="lab-auth-toggle"/>
+          Authenticated DVWA lab scan (local lab only)
         </label>
+      </div>
+      <div class="lab-auth-fields" id="lab-auth-fields">
+        <input id="lab-username" type="text" autocomplete="username"
+               placeholder="DVWA username" maxlength="256"/>
+        <input id="lab-password" type="password" autocomplete="current-password"
+               placeholder="DVWA password" maxlength="1024"/>
+        <div class="lab-auth-note">Credentials are sent only to this local scanner for the configured DVWA origin. They are not logged or included in reports.</div>
       </div>
 
       <div class="error-box" id="error-box"></div>
@@ -637,7 +666,14 @@ let lastUrl = '', lastCrawl = false, lastReport = null;
 
 /* Helpers */
 const $  = id => document.getElementById(id);
-const esc = s  => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const labAuthToggle = $('lab-auth-toggle');
+labAuthToggle.addEventListener('change', () => {
+  $('lab-auth-fields').classList.toggle('visible', labAuthToggle.checked);
+  if (!labAuthToggle.checked) {
+    $('lab-username').value = '';
+    $('lab-password').value = '';
+  }
+});
 
 /* FIXED: renamed function */
 function scrollToSection(id) {
@@ -684,7 +720,7 @@ function addLog(msg, type = 'info') {
 
   const line = document.createElement('div');
   line.className = `log-line ${type}`;
-  line.innerHTML = `<span>${ts}</span> <span>${icons[type]}</span> <span>${esc(msg)}</span>`;
+  line.textContent = `${ts} ${icons[type] || icons.info} ${msg}`;
 
   pb.appendChild(line);
   pb.scrollTop = pb.scrollHeight;
@@ -697,12 +733,30 @@ function clearLog() {
 }
 
 /* Scan */
+function scanResultStatus(result) {
+  if (result.finding_type === 'partial' && result.name === 'SQL Injection') {
+    return 'PARTIALLY TESTED — no indicator in tested GET inputs';
+  }
+  if (result.finding_type === 'partial') return result.status || 'PARTIALLY TESTED';
+  if (result.finding_type === 'unsupported') return result.status || 'NOT TESTED';
+  if (result.finding_type === 'error') return 'CHECK ERROR';
+  return result.detected ? 'POSSIBLE FINDING' : 'NO INDICATOR';
+}
+
 async function startScan() {
   const url  = $('url-input').value.trim();
   const crawl = $('crawl-toggle').checked;
+  const authenticated = $('lab-auth-toggle').checked;
 
-  if (!url) return showError('Enter URL');
-  if (!url.startsWith('http')) return showError('Invalid URL');
+  if (!url) return showError('Enter a target URL');
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+      return showError('Use an absolute http:// or https:// URL');
+    }
+  } catch {
+    return showError('Enter a valid URL');
+  }
 
   hideError();
   clearLog();
@@ -711,14 +765,22 @@ async function startScan() {
   lastCrawl = crawl;
 
   $('scan-btn').disabled = true;
+  $('scan-btn').textContent = 'SCANNING...';
+  $('scan-panel').classList.add('scanning');
 
   try {
-    addLog('Starting scan...');
+    addLog('Submitting scan request...');
 
     const resp = await fetch('/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, crawl })
+      body: JSON.stringify(authenticated
+        ? {
+            url, crawl, authenticated: true,
+            username: $('lab-username').value,
+            password: $('lab-password').value
+          }
+        : { url, crawl })
     });
 
     let data;
@@ -733,58 +795,221 @@ async function startScan() {
       showError(data.error || 'Scan failed');
       return;
     }
+    if (!Array.isArray(data.results) || !data.summary) {
+      showError('Server returned an incomplete scan report');
+      return;
+    }
 
     lastReport = data;
 
+    renderResults(data);
+    for (const result of data.results) {
+      const state = scanResultStatus(result);
+      addLog(
+        `${result.name}: ${state}`,
+        ['error', 'unsupported'].includes(result.finding_type) ? 'warn' : 'ok'
+      );
+    }
+    const scanPerf = data.scan_performance || {};
+    if (scanPerf.authentication_mode_enabled) {
+      addLog(
+        `Authentication: enabled; login/session ${scanPerf.login_session_establishment || 'not attempted'}; protected access ${scanPerf.protected_access_verified ? 'verified' : 'not verified'}`,
+        scanPerf.login_session_establishment === 'succeeded' && scanPerf.protected_access_verified
+          ? 'ok'
+          : 'warn'
+      );
+    }
     addLog('Scan completed', 'ok');
 
-    renderResults(data);
-
   } catch (e) {
-    showError('Network error');
+    showError('The scan request failed. Check the server connection and try again.');
   } finally {
+    $('lab-password').value = '';
+    if (authenticated) $('lab-username').value = '';
     $('scan-btn').disabled = false;
+    $('scan-btn').textContent = '▶ SCAN';
+    $('scan-panel').classList.remove('scanning');
   }
 }
 
 /* Render Results */
 function renderResults(data) {
-  const results = data.results;
+  const results = Array.isArray(data.results) ? data.results : [];
+  const summary = data.summary || {};
+  const perf = data.scan_performance || {};
+  const severity = summary.severity_breakdown || {};
 
+  $('kpi-panel').classList.remove('hidden');
+  $('chart-panel').classList.remove('hidden');
   $('results-panel').classList.remove('hidden');
   $('export-panel').classList.remove('hidden');
 
+  $('kpi-target').textContent = data.meta?.target || lastUrl;
+  $('kpi-ts').textContent = data.meta?.generated_at
+    ? new Date(data.meta.generated_at).toLocaleString()
+    : '';
+  const risk = $('kpi-risk-badge');
+  risk.textContent = `RISK: ${summary.overall_risk || 'UNKNOWN'}`;
+  risk.className = `risk-badge risk-${summary.overall_risk || 'UNKNOWN'}`;
+
+  const kpis = [
+    ['Checks', summary.total_checks ?? results.length, 'info'],
+    ['Pages', perf.total_pages_scanned ?? perf.pages_crawled ?? 0, 'info'],
+    ['Possible', summary.possible_findings ?? summary.vulnerabilities_detected ?? 0, 'warn'],
+    ['Confirmed', summary.confirmed_findings ?? 0, 'danger'],
+    ['Check errors', summary.checks_with_errors ?? 0, 'dim'],
+    ['Not tested', summary.unsupported_checks ?? 0, 'dim'],
+    ['Partially tested', summary.partially_tested_checks ?? 0, 'dim']
+  ];
+  const grid = $('kpi-grid');
+  grid.replaceChildren();
+  for (const [label, value, tone] of kpis) {
+    const box = document.createElement('div');
+    box.className = `kpi-box ${tone}`;
+    const number = document.createElement('div');
+    number.className = 'kpi-value';
+    number.textContent = String(value);
+    const caption = document.createElement('div');
+    caption.className = 'kpi-label';
+    caption.textContent = label;
+    box.append(number, caption);
+    grid.appendChild(box);
+  }
+
+  $('perf-strip').textContent =
+    `Duration: ${perf.duration_seconds ?? 0}s | Checks: ${perf.total_checks_performed ?? perf.checks_run ?? results.length}`;
+  $('donut-detected').textContent = String(summary.vulnerabilities_detected ?? 0);
+  renderDonut(severity);
+
   const tbody = $('results-tbody');
-  tbody.innerHTML = '';
+  tbody.replaceChildren();
+  if (!results.length) {
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 5;
+    cell.textContent = 'No checks returned results.';
+    row.appendChild(cell);
+    tbody.appendChild(row);
+  }
 
   results.forEach((r, idx) => {
     const tr = document.createElement('tr');
-
-    tr.innerHTML = `
-      <td>${r.name}</td>
-      <td>${r.owasp}</td>
-      <td>${r.severity}</td>
-      <td>${r.status}</td>
-      <td><button onclick="toggleDetails(${idx})">Details</button></td>
-    `;
+    for (const value of [r.name, r.owasp, r.severity, scanResultStatus(r)]) {
+      const cell = document.createElement('td');
+      cell.textContent = value || '';
+      tr.appendChild(cell);
+    }
+    const actionCell = document.createElement('td');
+    const detailButton = document.createElement('button');
+    detailButton.type = 'button';
+    detailButton.textContent = 'Details';
+    detailButton.addEventListener('click', () => toggleDetails(idx));
+    actionCell.appendChild(detailButton);
+    tr.appendChild(actionCell);
 
     tbody.appendChild(tr);
 
     const detail = document.createElement('tr');
     detail.id = `detail-${idx}`;
     detail.style.display = 'none';
-
-    detail.innerHTML = `
-      <td colspan="5">
-        ${r.details.map(d => `<div>${esc(d)}</div>`).join('')}
-      </td>
-    `;
+    const detailCell = document.createElement('td');
+    detailCell.colSpan = 5;
+    const detailLines = [
+      ...(Array.isArray(r.details) ? r.details : []),
+      ...(Array.isArray(r.evidence) ? r.evidence.map(item => item.description || '') : []),
+      r.affected_url ? `Affected URL: ${r.affected_url}` : '',
+      r.recommendation ? `Recommendation: ${r.recommendation}` : ''
+    ].filter(Boolean);
+    for (const line of detailLines) {
+      const paragraph = document.createElement('div');
+      paragraph.textContent = line;
+      detailCell.appendChild(paragraph);
+    }
+    detail.appendChild(detailCell);
 
     tbody.appendChild(detail);
   });
+
+  renderCrawlMap(perf.pages);
 }
 
-/* FIXED toggle */
+function renderDonut(counts) {
+  const canvas = $('donut-chart');
+  const context = canvas.getContext('2d');
+  if (!context) return;
+  const size = 160;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = size * ratio;
+  canvas.height = size * ratio;
+  context.scale(ratio, ratio);
+  context.clearRect(0, 0, size, size);
+  const items = [
+    ['Critical', '#ff2d5f'], ['High', '#ff7d3b'], ['Medium', '#ffc820'],
+    ['Low', '#00e87a'], ['None', '#4a6a8a']
+  ].map(([label, color]) => ({label, color, value: Number(counts[label]) || 0}));
+  const total = items.reduce((sum, item) => sum + item.value, 0);
+  const center = size / 2;
+  const radius = 62;
+  let angle = -Math.PI / 2;
+  if (total === 0) {
+    context.beginPath();
+    context.arc(center, center, radius, 0, Math.PI * 2);
+    context.strokeStyle = '#1a3a5c';
+    context.lineWidth = 18;
+    context.stroke();
+  } else {
+    for (const item of items.filter(item => item.value > 0)) {
+      const next = angle + item.value / total * Math.PI * 2;
+      context.beginPath();
+      context.arc(center, center, radius, angle, next);
+      context.strokeStyle = item.color;
+      context.lineWidth = 18;
+      context.stroke();
+      angle = next;
+    }
+  }
+  const legend = $('chart-legend');
+  legend.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement('div');
+    row.className = 'legend-item';
+    const dot = document.createElement('span');
+    dot.className = 'legend-dot';
+    dot.style.backgroundColor = item.color;
+    const name = document.createElement('span');
+    name.className = 'legend-name';
+    name.textContent = item.label;
+    const count = document.createElement('span');
+    count.className = 'legend-count';
+    count.textContent = String(item.value);
+    row.append(dot, name, count);
+    legend.appendChild(row);
+  }
+}
+
+function renderCrawlMap(pages) {
+  const panel = $('crawl-panel');
+  const tbody = $('crawl-tbody');
+  tbody.replaceChildren();
+  if (!Array.isArray(pages) || pages.length === 0) {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.classList.remove('hidden');
+  pages.forEach((page, index) => {
+    const row = document.createElement('tr');
+    for (const value of [
+      index + 1, page.url || '', page.status ?? '', page.title || '',
+      page.form_count ?? 0, page.elapsed ?? ''
+    ]) {
+      const cell = document.createElement('td');
+      cell.textContent = String(value);
+      row.appendChild(cell);
+    }
+    tbody.appendChild(row);
+  });
+}
+
 function toggleDetails(idx) {
   const row = document.getElementById(`detail-${idx}`);
   if (!row) return;
@@ -792,26 +1017,50 @@ function toggleDetails(idx) {
   row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
 }
 
-/* FIXED export */
-async function exportReport(format) {
-  const url = lastUrl || $('url-input').value.trim();
+function resetAll() {
+  lastUrl = '';
+  lastCrawl = false;
+  lastReport = null;
+  $('url-input').value = '';
+  $('crawl-toggle').checked = false;
+  $('lab-auth-toggle').checked = false;
+  $('lab-username').value = '';
+  $('lab-password').value = '';
+  $('lab-auth-fields').classList.remove('visible');
+  clearLog();
+  hideError();
+  for (const id of ['kpi-panel', 'chart-panel', 'results-panel', 'crawl-panel', 'export-panel']) {
+    $(id).classList.add('hidden');
+  }
+}
 
-  if (!url) return showError('Run scan first');
+async function exportReport(format) {
+  if (!lastReport) return showError('Run a scan before exporting a report');
 
   const endpoint = format === 'pdf' ? '/export/pdf' : '/export/json';
-
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ url, crawl: lastCrawl })
-  });
-
-  const blob = await resp.blob();
-
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `report.${format}`;
-  a.click();
+  try {
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ report: lastReport })
+    });
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({}));
+      showError(error.error || `Could not export ${format.toUpperCase()} report`);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `owasp-report.${blob.type.includes('pdf') ? 'pdf' : blob.type.includes('json') ? 'json' : 'txt'}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch {
+    showError('Report download failed. Check the server connection and try again.');
+  }
 }
 </script>
 </body>
