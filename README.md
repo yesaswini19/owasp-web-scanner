@@ -150,6 +150,8 @@ docker build -t owasp-scanner:local .
 
 ## Public deployment on Render
 
+Live service: <https://owasp-web-scanner-9gbd.onrender.com/login> (administrator sign-in required). This is the scanner's application URL, not an approved scan target; configure `SCANNER_ALLOWED_TARGETS` separately with exact origins of websites you own or are authorized to test.
+
 The public service requires application authentication and a non-empty exact-origin allowlist. It must not be deployed with missing, placeholder, or overly broad target entries. Only list HTTP(S) origins for systems you own or are explicitly authorized to assess. The scanner still blocks localhost, private, reserved, and non-routable destinations and pins validated DNS results when connecting.
 
 Generate the Flask signing key and administrator password hash locally; do not commit either value:
@@ -193,7 +195,7 @@ Render terminates HTTPS in front of the container. Keep `SCANNER_COOKIE_SECURE=t
 
 Login attempts are rate-limited with a local SQLite database. Limits are shared between workers on one instance but are not shared across Render instances and the database is ephemeral. Keep a single instance unless you add a shared rate-limit store; consider additional edge-level rate limiting because the account-wide limit can temporarily lock out legitimate sign-in attempts.
 
-Do not set `SCANNER_COOKIE_SECURE=false` on Render, do not configure `SCANNER_LOCAL_LAB_*` variables, and do not deploy the DVWA container publicly. Reports are generated in memory and streamed; no report directory or persistent disk is required. Render deployment is not performed by this project.
+Do not set `SCANNER_COOKIE_SECURE=false` on Render, do not configure `SCANNER_LOCAL_LAB_*` variables, and do not deploy the DVWA container publicly. Reports are generated in memory and streamed; no report directory or persistent disk is required. This repository does not deploy the service automatically.
 
 ## Run the isolated DVWA lab
 
