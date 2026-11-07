@@ -36,7 +36,68 @@ def test_url_validation_rejects_dns_private_and_reserved_addresses(monkeypatch):
         scanner._validate_url("https://example.test/")
 
 
+def test_allowlisted_origin_requires_exact_scheme_host_and_port(monkeypatch):
+    monkeypatch.setenv(
+        "SCANNER_ALLOWED_TARGETS", "https://example.test:443",
+    )
+    monkeypatch.setattr(
+        scanner.socket, "getaddrinfo",
+        lambda host, port, type: _address_record("93.184.216.34", port),
+    )
+    assert scanner._validate_url("https://example.test:443/path") == (
+        "https://example.test:443/path"
+    )
+
+    for url in (
+        "http://example.test:80/",
+        "https://example.test:444/",
+        "https://unlisted.example.test:443/",
+    ):
+        with pytest.raises(scanner.URLValidationError, match="SCANNER_ALLOWED_TARGETS"):
+            scanner._validate_url(url)
+
+
+def test_allowlist_missing_or_wildcard_disables_scanning(monkeypatch):
+    monkeypatch.setenv("SCANNER_ALLOWED_TARGETS", "")
+    with pytest.raises(scanner.URLValidationError, match="Scanning is disabled"):
+        scanner._validate_url("https://example.test:443/")
+
+    monkeypatch.setenv("SCANNER_ALLOWED_TARGETS", "https://*.example.test:443")
+    with pytest.raises(scanner.URLValidationError, match="exact http"):
+        scanner._validate_url("https://example.test:443/")
+
+
+def test_missing_allowlist_disables_even_the_pinned_lab_target(monkeypatch):
+    monkeypatch.setenv("SCANNER_ALLOWED_TARGETS", "")
+    monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
+    monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
+    with pytest.raises(scanner.URLValidationError, match="Scanning is disabled"):
+        scanner._validate_url("http://dvwa:80/")
+
+
+def test_unallowlisted_public_host_is_rejected_before_dns(monkeypatch):
+    monkeypatch.setattr(
+        scanner.socket, "getaddrinfo",
+        lambda *_args, **_kwargs: pytest.fail("unapproved origins must not be resolved"),
+    )
+    with pytest.raises(scanner.URLValidationError, match="SCANNER_ALLOWED_TARGETS"):
+        scanner._validate_url("https://other.example.test:443/")
+
+
+def test_allowlisted_private_dns_still_fails_ssrf_validation(monkeypatch):
+    monkeypatch.setenv(
+        "SCANNER_ALLOWED_TARGETS", "https://private.example.test:443",
+    )
+    monkeypatch.setattr(
+        scanner.socket, "getaddrinfo",
+        lambda host, port, type: _address_record("10.20.30.40", port),
+    )
+    with pytest.raises(scanner.URLValidationError, match="private"):
+        scanner._validate_url("https://private.example.test:443/")
+
+
 def test_local_lab_mode_allows_only_configured_host_port_and_pinned_ip(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "development")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
     monkeypatch.setattr(
@@ -56,6 +117,7 @@ def test_local_lab_mode_allows_only_configured_host_port_and_pinned_ip(monkeypat
 
 
 def test_local_lab_mode_rejects_dns_rebinding_and_nonmatching_addresses(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "development")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
     monkeypatch.setattr(
@@ -68,6 +130,7 @@ def test_local_lab_mode_rejects_dns_rebinding_and_nonmatching_addresses(monkeypa
 
 
 def test_local_lab_mode_rejects_redirects_to_other_ports(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "development")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
     monkeypatch.setattr(
@@ -94,10 +157,20 @@ def test_local_lab_mode_rejects_redirects_to_other_ports(monkeypatch):
 
 
 def test_local_lab_mode_requires_complete_valid_configuration(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "development")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
     monkeypatch.delenv("SCANNER_LOCAL_LAB_IP", raising=False)
 
     with pytest.raises(scanner.URLValidationError, match="requires both"):
+        scanner._validate_url("http://dvwa:80/")
+
+
+def test_private_lab_exception_is_disabled_outside_development(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "production")
+    monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
+    monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
+
+    with pytest.raises(scanner.URLValidationError, match="only in development"):
         scanner._validate_url("http://dvwa:80/")
 
 
@@ -124,6 +197,29 @@ def test_request_rejects_redirect_outside_approved_host(monkeypatch):
 
     monkeypatch.setattr(scanner, "_one_request", lambda *args, **kwargs: calls.append(args) or Redirect())
     response, _elapsed = scanner._request("GET", "https://example.test/")
+
+    assert response is None
+    assert len(calls) == 1
+
+
+def test_request_rejects_redirect_to_different_allowed_origin(monkeypatch):
+    monkeypatch.setattr(
+        scanner.socket, "getaddrinfo",
+        lambda host, port, type: _address_record("93.184.216.34", port),
+    )
+    calls = []
+
+    class Redirect:
+        status_code = 302
+        headers = {"Location": "http://example.test:80/other"}
+        url = "https://example.test:443/"
+        cookies = requests.cookies.RequestsCookieJar()
+
+    monkeypatch.setattr(
+        scanner, "_one_request",
+        lambda *args, **kwargs: calls.append(args) or Redirect(),
+    )
+    response, _elapsed = scanner._request("GET", "https://example.test:443/")
 
     assert response is None
     assert len(calls) == 1
@@ -235,6 +331,7 @@ def test_request_carries_redirect_cookies_only_within_the_same_request(monkeypat
 
 
 def test_dvwa_login_uses_only_login_fields_and_keeps_cookies_ephemeral(monkeypatch, caplog):
+    monkeypatch.setenv("SCANNER_ENV", "development")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
     monkeypatch.setenv("SCANNER_LOCAL_LAB_AUTH_ENABLED", "1")
@@ -308,6 +405,7 @@ def test_dvwa_login_uses_only_login_fields_and_keeps_cookies_ephemeral(monkeypat
 
 
 def test_dvwa_login_rejects_non_configured_target_before_requests(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "development")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
     monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
     monkeypatch.setenv("SCANNER_LOCAL_LAB_AUTH_ENABLED", "1")
@@ -321,6 +419,9 @@ def test_dvwa_login_rejects_non_configured_target_before_requests(monkeypatch):
 
 
 def test_scanner_passes_auth_cookie_to_checks_without_reporting_it(monkeypatch):
+    monkeypatch.setenv("SCANNER_ENV", "development")
+    monkeypatch.setenv("SCANNER_LOCAL_LAB_URL", "http://dvwa:80")
+    monkeypatch.setenv("SCANNER_LOCAL_LAB_IP", LAB_TEST_IP)
     monkeypatch.setattr(
         scanner, "_authenticate_local_dvwa",
         lambda *_args: (
@@ -472,6 +573,71 @@ def test_crawler_discovers_same_host_links_once_and_excludes_other_hosts(monkeyp
     assert requested.count("https://example.test/page") == 1
     assert all("other.example" not in url for url in requested)
     assert headers_seen == [auth_headers, auth_headers]
+
+
+def test_crawler_stays_on_seed_origin_when_another_origin_is_allowlisted(monkeypatch):
+    monkeypatch.setenv(
+        "SCANNER_ALLOWED_TARGETS",
+        "https://example.test:443,https://example.test:444",
+    )
+    monkeypatch.setattr(
+        scanner.socket, "getaddrinfo",
+        lambda host, port, type: _address_record("93.184.216.34", port),
+    )
+    response = type("Response", (), {
+        "headers": {"Content-Type": "text/html"},
+        "text": (
+            '<a href="/same-origin">same origin</a>'
+            '<a href="https://example.test:444/other-origin">other origin</a>'
+        ),
+        "status_code": 200,
+    })()
+    monkeypatch.setattr(scanner, "_get", lambda *_args, **_kwargs: (response, 0.01))
+
+    crawler = scanner.Crawler("https://example.test:443/")
+    page = crawler._fetch_page("https://example.test:443/")
+
+    assert page["_links"] == ["https://example.test:443/same-origin"]
+
+
+def test_get_form_checks_stay_on_seed_origin_when_other_origin_is_allowlisted(monkeypatch):
+    monkeypatch.setenv(
+        "SCANNER_ALLOWED_TARGETS",
+        "https://example.test:443,https://example.test:444",
+    )
+    monkeypatch.setattr(
+        scanner.socket, "getaddrinfo",
+        lambda host, port, type: _address_record("93.184.216.34", port),
+    )
+    response = type("Response", (), {
+        "url": "https://example.test:443/",
+        "status_code": 200,
+        "headers": {"Content-Type": "text/html"},
+        "text": (
+            '<form method="get" action="https://example.test:444/search">'
+            '<input name="q">'
+            '</form>'
+        ),
+    })()
+    requests_seen = []
+
+    def fake_get(url, *args, **kwargs):
+        requests_seen.append(url)
+        return response, 0.01
+
+    monkeypatch.setattr(scanner, "_get", fake_get)
+
+    sqli_result = scanner.check_sql_injection("https://example.test:443/")
+    sqli_requests = list(requests_seen)
+    requests_seen.clear()
+    xss_result = scanner.check_xss("https://example.test:443/")
+
+    assert sqli_result["status"] == "NOT TESTED"
+    assert all(scanner._url_origin(scanner.urlsplit(url)) == ("https", "example.test", 443)
+               for url in sqli_requests)
+    assert all(scanner._url_origin(scanner.urlsplit(url)) == ("https", "example.test", 443)
+               for url in requests_seen)
+    assert xss_result["finding_type"] == "none"
 
 
 def test_crawler_records_form_structure_without_field_values(monkeypatch):

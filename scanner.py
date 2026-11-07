@@ -131,6 +131,8 @@ def _local_lab_config():
     address_text = os.environ.get("SCANNER_LOCAL_LAB_IP")
     if not target and not address_text:
         return None
+    if os.environ.get("SCANNER_ENV") != "development":
+        raise URLValidationError("The private lab exception is available only in development mode.")
     if not target or not address_text:
         raise URLValidationError("Local lab mode requires both target URL and pinned IP settings.")
     try:
@@ -176,9 +178,74 @@ def validate_local_lab_auth_target(url: str) -> None:
 
 def _url_origin(parsed):
     scheme = parsed.scheme.lower()
-    return scheme, (parsed.hostname or "").rstrip(".").lower(), parsed.port or (
+    return scheme, _normalize_hostname(parsed.hostname or ""), parsed.port or (
         443 if scheme == "https" else 80
     )
+
+
+def _normalize_hostname(host: str) -> str:
+    try:
+        normalized = host.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise URLValidationError("The target hostname is invalid.") from exc
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        raise URLValidationError("Target allowlist entries must use explicit hostnames, not IP addresses.")
+    labels = normalized.split(".")
+    if (
+        not normalized
+        or len(normalized) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels
+        )
+    ):
+        raise URLValidationError("The target hostname is invalid.")
+    return normalized
+
+
+def _allowed_target_origins() -> set[tuple[str, str, int]]:
+    configured = os.environ.get("SCANNER_ALLOWED_TARGETS", "")
+    if not configured.strip():
+        raise URLValidationError(
+            "Scanning is disabled. Configure SCANNER_ALLOWED_TARGETS with exact approved origins."
+        )
+
+    origins = set()
+    for entry in configured.split(","):
+        entry = entry.strip()
+        try:
+            parsed = urlsplit(entry)
+            port = parsed.port
+            hostname = parsed.hostname
+        except ValueError as exc:
+            raise URLValidationError("SCANNER_ALLOWED_TARGETS contains an invalid origin.") from exc
+        if (
+            not entry
+            or "*" in entry
+            or parsed.scheme.lower() not in ("http", "https")
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise URLValidationError(
+                "SCANNER_ALLOWED_TARGETS entries must be exact http(s) origins with an explicit port."
+            )
+        origins.add((parsed.scheme.lower(), _normalize_hostname(hostname), port))
+    if not origins:
+        raise URLValidationError(
+            "Scanning is disabled. Configure SCANNER_ALLOWED_TARGETS with exact approved origins."
+        )
+    return origins
 
 
 def _log_target(url: str) -> str:
@@ -198,7 +265,7 @@ def _log_target(url: str) -> str:
 
 
 def _validate_url(url: str, allowed_host: str = None, allowed_origin=None) -> str:
-    """Normalize a public HTTP(S) URL and reject unsafe or out-of-scope targets."""
+    """Validate an exact allowlisted HTTP(S) origin and reject unsafe destinations."""
     if not isinstance(url, str) or not url or len(url) > 2048:
         raise URLValidationError("Enter a valid HTTP or HTTPS URL (maximum 2048 characters).")
     if any(ord(char) < 32 or char.isspace() for char in url) or "\\" in url:
@@ -208,13 +275,15 @@ def _validate_url(url: str, allowed_host: str = None, allowed_origin=None) -> st
         port = parsed.port
     except ValueError as exc:
         raise URLValidationError("The URL or port is malformed.") from exc
-    host = parsed.hostname
-    if parsed.scheme.lower() not in ("http", "https") or not host:
+    raw_host = parsed.hostname
+    if parsed.scheme.lower() not in ("http", "https") or not raw_host:
         raise URLValidationError("Only absolute http:// and https:// URLs are allowed.")
     if parsed.username is not None or parsed.password is not None:
         raise URLValidationError("URLs containing user credentials are not allowed.")
-    host = host.rstrip(".").lower()
+    host = _normalize_hostname(raw_host)
     origin = _url_origin(parsed)
+    if origin not in _allowed_target_origins():
+        raise URLValidationError("The target origin is not in SCANNER_ALLOWED_TARGETS.")
     lab_config = _local_lab_config()
     is_local_lab_target = bool(lab_config and origin == lab_config[0])
     if allowed_origin and origin != allowed_origin:
@@ -343,8 +412,6 @@ def _request(method, url, params=None, data=None, **kwargs):
         current = _validate_url(url)
         initial_host = urlsplit(current).hostname
         initial_origin = _url_origin(urlsplit(current))
-        lab_config = _local_lab_config()
-        lab_origin = lab_config[0] if lab_config and _url_origin(urlsplit(current)) == lab_config[0] else None
         request_headers = dict(headers or {})
         response_cookies = requests.cookies.RequestsCookieJar()
         for redirect_count in range(MAX_REDIRECTS + 1):
@@ -366,7 +433,7 @@ def _request(method, url, params=None, data=None, **kwargs):
             current = _validate_url(
                 urljoin(response.url, location),
                 allowed_host=initial_host,
-                allowed_origin=lab_origin,
+                allowed_origin=initial_origin,
             )
             if _url_origin(urlsplit(current)) == initial_origin:
                 if response_cookies:
@@ -539,6 +606,7 @@ class Crawler:
         self.seed_url    = _validate_url(seed_url)
         self.max_pages   = max(1, min(int(max_pages), MAX_CRAWL_PAGES))
         self.base_domain = urlsplit(self.seed_url).hostname
+        self.base_origin = _url_origin(urlsplit(self.seed_url))
         self.headers     = dict(headers or {})
         self._visited    = set()
         self._lock       = threading.Lock()
@@ -609,7 +677,11 @@ class Crawler:
         for tag in soup.find_all("a", href=True):
             abs_link = urljoin(url, tag["href"])
             try:
-                normalized = _validate_url(abs_link, allowed_host=self.base_domain)
+                normalized = _validate_url(
+                    abs_link,
+                    allowed_host=self.base_domain,
+                    allowed_origin=self.base_origin,
+                )
             except URLValidationError:
                 continue
             norm = self._normalize(normalized)
@@ -723,7 +795,11 @@ def check_sql_injection(
             continue
         action = urljoin(url, form.get("action") or url)
         try:
-            action = _validate_url(action, allowed_host=parsed.hostname)
+            action = _validate_url(
+                action,
+                allowed_host=parsed.hostname,
+                allowed_origin=_url_origin(parsed),
+            )
         except URLValidationError:
             continue
         form_data = _build_form_data(form, SQL_PAYLOADS[0])
@@ -905,7 +981,11 @@ def check_xss(
             continue
         action = urljoin(url, form.get("action") or url)
         try:
-            action = _validate_url(action, allowed_host=parsed.hostname)
+            action = _validate_url(
+                action,
+                allowed_host=parsed.hostname,
+                allowed_origin=_url_origin(parsed),
+            )
         except URLValidationError:
             continue
         form_data = _build_form_data(form, XSS_PAYLOADS[0])

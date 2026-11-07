@@ -1,14 +1,24 @@
 """Flask application for the local OWASP scanner dashboard and API."""
 
 import io
+import hmac
 import json
 import logging
 import math
+import os
+import secrets
+import sqlite3
+import tempfile
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
-from flask import Flask, jsonify, make_response, render_template, request, send_file
+from flask import (
+    Flask, jsonify, make_response, redirect, render_template, request, send_file,
+    session, url_for,
+)
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
+from werkzeug.security import check_password_hash
 
 from scanner import (
     SecurityScanner,
@@ -21,6 +31,17 @@ from report import ReportGenerator, build_pdf, build_text_report
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY")
+app.config.update(
+    SESSION_COOKIE_NAME="owasp_scanner_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=30),
+    LOGIN_RATE_LIMIT_DB=os.path.join(
+        tempfile.gettempdir(), "owasp-scanner-login-rate-limit.sqlite3",
+    ),
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +55,159 @@ _scan_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
 
 class ScanCapacityError(RuntimeError):
     """Raised when all local scan slots are in use."""
+
+
+def _auth_settings() -> dict | None:
+    username = os.environ.get("SCANNER_ADMIN_USERNAME", "")
+    password_hash = os.environ.get("SCANNER_ADMIN_PASSWORD_HASH", "")
+    secret_key = os.environ.get("SECRET_KEY", "")
+    cookie_secure = os.environ.get("SCANNER_COOKIE_SECURE", "true").lower()
+    hash_parts = password_hash.split("$")
+    valid_hash = (
+        len(hash_parts) == 3
+        and hash_parts[0] == "scrypt:32768:8:1"
+        and len(hash_parts[1]) == 16
+        and hash_parts[1].isascii()
+        and hash_parts[1].isalnum()
+        and len(hash_parts[2]) == 128
+        and all(char in "0123456789abcdef" for char in hash_parts[2].lower())
+    )
+    development_cookie_setting = (
+        cookie_secure == "false"
+        and os.environ.get("SCANNER_ENV") == "development"
+    )
+    if (
+        not username
+        or len(username) > 128
+        or any(ord(char) < 32 for char in username)
+        or not valid_hash
+        or len(secret_key.encode("utf-8")) < 32
+        or cookie_secure not in ("true", "false")
+        or (cookie_secure == "false" and not development_cookie_setting)
+    ):
+        return None
+
+    app.config["SESSION_COOKIE_SECURE"] = cookie_secure == "true"
+    return {"username": username, "password_hash": password_hash}
+
+
+def _ensure_csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not isinstance(token, str):
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def _csrf_is_valid() -> bool:
+    expected = session.get("csrf_token")
+    supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
+    return (
+        isinstance(expected, str)
+        and isinstance(supplied, str)
+        and hmac.compare_digest(expected, supplied)
+    )
+
+
+def _login_rate_limit_keys() -> tuple[str, str]:
+    secret = app.config["SECRET_KEY"].encode("utf-8")
+    remote = request.remote_addr or "unknown"
+    address_key = hmac.new(
+        secret, f"login-ip:{remote}".encode("utf-8"), "sha256",
+    ).hexdigest()
+    return f"ip:{address_key}", "account:admin"
+
+
+def _consume_login_attempt() -> int:
+    now = time.time()
+    window_seconds = 15 * 60
+    limits = {key: limit for key, limit in zip(_login_rate_limit_keys(), (20, 5))}
+    with sqlite3.connect(app.config["LOGIN_RATE_LIMIT_DB"], timeout=5) as database:
+        database.execute(
+            "CREATE TABLE IF NOT EXISTS login_attempts "
+            "(bucket TEXT PRIMARY KEY, window_start REAL NOT NULL, attempts INTEGER NOT NULL)"
+        )
+        database.execute("BEGIN IMMEDIATE")
+        rows = {
+            key: (window_start, attempts)
+            for key, window_start, attempts in database.execute(
+                "SELECT bucket, window_start, attempts FROM login_attempts "
+                "WHERE bucket IN (?, ?)",
+                tuple(limits),
+            )
+        }
+        retry_after = 0
+        for key, limit in limits.items():
+            row = rows.get(key)
+            if row and now - row[0] < window_seconds and row[1] >= limit:
+                retry_after = max(
+                    retry_after, int(row[0] + window_seconds - now) + 1,
+                )
+        if retry_after:
+            database.commit()
+            return retry_after
+
+        for key in limits:
+            row = rows.get(key)
+            if not row or now - row[0] >= window_seconds:
+                database.execute(
+                    "INSERT INTO login_attempts(bucket, window_start, attempts) "
+                    "VALUES (?, ?, 1) ON CONFLICT(bucket) DO UPDATE SET "
+                    "window_start=excluded.window_start, attempts=1",
+                    (key, now),
+                )
+            else:
+                database.execute(
+                    "UPDATE login_attempts SET attempts=attempts+1 WHERE bucket=?",
+                    (key,),
+                )
+        database.commit()
+    return 0
+
+
+def _clear_login_rate_limit() -> None:
+    keys = _login_rate_limit_keys()
+    with sqlite3.connect(app.config["LOGIN_RATE_LIMIT_DB"], timeout=5) as database:
+        database.execute(
+            "DELETE FROM login_attempts WHERE bucket IN (?, ?)", keys,
+        )
+
+
+@app.before_request
+def enforce_application_authentication():
+    settings = _auth_settings()
+    if request.endpoint == "health":
+        if settings is None:
+            return _error_response("Authentication configuration is incomplete.", 503)
+        return None
+    if settings is None:
+        return _error_response("Authentication configuration is incomplete.", 503)
+
+    if request.endpoint in {"static", "login"}:
+        if request.endpoint == "login" and request.method == "POST":
+            if not _csrf_is_valid():
+                return render_template(
+                    "login.html", error="The form expired. Reload the page and try again.",
+                    csrf_token=_ensure_csrf_token(),
+                ), 400
+        return None
+
+    if not session.get("authenticated"):
+        if request.endpoint == "index" and request.method in {"GET", "HEAD"}:
+            return redirect(url_for("login"))
+        return _error_response("Authentication is required.", 401)
+
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not _csrf_is_valid():
+        return _error_response("A valid CSRF token is required.", 400)
+    return None
+
+
+@app.after_request
+def set_private_response_headers(response):
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 def _parse_json_object() -> dict:
@@ -169,7 +343,72 @@ def request_too_large(_error):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", csrf_token=_ensure_csrf_token())
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        if session.get("authenticated"):
+            return redirect(url_for("index"))
+        return render_template("login.html", error=None, csrf_token=_ensure_csrf_token())
+
+    try:
+        retry_after = _consume_login_attempt()
+    except sqlite3.Error as exc:
+        logger.error("Login rate limiter unavailable (%s).", type(exc).__name__)
+        return _error_response("Login is temporarily unavailable.", 503)
+    if retry_after:
+        response = make_response(
+            render_template(
+                "login.html", error="Too many login attempts. Try again later.",
+                csrf_token=_ensure_csrf_token(),
+            ),
+            429,
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
+    settings = _auth_settings()
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    username_valid = (
+        isinstance(username, str)
+        and len(username) <= 128
+        and hmac.compare_digest(
+            username.encode("utf-8"), settings["username"].encode("utf-8"),
+        )
+    )
+    password_valid = (
+        isinstance(password, str)
+        and len(password) <= 1024
+        and check_password_hash(
+            settings["password_hash"], password,
+        )
+    )
+    if not username_valid or not password_valid:
+        return render_template(
+            "login.html", error="Invalid username or password.",
+            csrf_token=_ensure_csrf_token(),
+        ), 401
+
+    try:
+        _clear_login_rate_limit()
+    except sqlite3.Error as exc:
+        logger.error("Login rate limiter unavailable (%s).", type(exc).__name__)
+        return _error_response("Login is temporarily unavailable.", 503)
+
+    session.clear()
+    session["authenticated"] = True
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    session.permanent = True
+    return redirect(url_for("index"))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.route("/health")
